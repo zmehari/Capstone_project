@@ -64,6 +64,7 @@ edx <- rbind(edx, removed)
 rm(dl, ratings, movies, test_index, temp, movielens, removed)
 
 
+
 ##########################################################
 # RMSE function
 ##########################################################
@@ -72,55 +73,23 @@ RMSE <- function(true_ratings, predicted_ratings){
 }
 
 ##########################################################
-# Baseline model: mean only
+# Train model using edx
 ##########################################################
+
+# Global mean
 mu <- mean(edx$rating)
 
-pred_mean <- rep(mu, nrow(final_holdout_test))
-rmse_mean <- RMSE(final_holdout_test$rating, pred_mean)
-
 ##########################################################
-# Movie effect model
-##########################################################
-movie_avgs <- edx %>%
-  group_by(movieId) %>%
-  summarize(b_i = mean(rating - mu), .groups = "drop")
-
-pred_movie <- final_holdout_test %>%
-  left_join(movie_avgs, by = "movieId") %>%
-  mutate(pred = mu + b_i)
-
-pred_movie$pred[is.na(pred_movie$pred)] <- mu
-
-rmse_movie <- RMSE(final_holdout_test$rating, pred_movie$pred)
-
-##########################################################
-# Movie + user effect model (unregularized)
-##########################################################
-user_avgs <- edx %>%
-  left_join(movie_avgs, by = "movieId") %>%
-  group_by(userId) %>%
-  summarize(b_u = mean(rating - mu - b_i), .groups = "drop")
-
-pred_movie_user <- final_holdout_test %>%
-  left_join(movie_avgs, by = "movieId") %>%
-  left_join(user_avgs, by = "userId") %>%
-  mutate(pred = mu + b_i + b_u)
-
-pred_movie_user$pred[is.na(pred_movie_user$pred)] <- mu
-
-rmse_movie_user <- RMSE(final_holdout_test$rating, pred_movie_user$pred)
-
-##########################################################
-# Regularized model (tuning using internal edx split)
+# Tune lambda using edx (simple internal split)
 ##########################################################
 set.seed(1)
 
 test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE)
 train_temp <- edx[-test_index, ]
-validation_temp <- edx[test_index, ]
+validate_temp <- edx[test_index, ]
 
-validation_temp <- validation_temp %>%
+# Ensure IDs match
+validate_temp <- validate_temp %>%
   semi_join(train_temp, by = "movieId") %>%
   semi_join(train_temp, by = "userId")
 
@@ -139,7 +108,7 @@ rmses <- sapply(lambdas, function(l){
     group_by(userId) %>%
     summarize(b_u = sum(rating - mu - b_i) / (n() + l), .groups = "drop")
 
-  preds <- validation_temp %>%
+  preds <- validate_temp %>%
     left_join(b_i, by = "movieId") %>%
     left_join(b_u, by = "userId") %>%
     mutate(pred = mu + b_i + b_u) %>%
@@ -147,15 +116,16 @@ rmses <- sapply(lambdas, function(l){
 
   preds[is.na(preds)] <- mu
 
-  RMSE(validation_temp$rating, preds)
+  RMSE(validate_temp$rating, preds)
 })
 
 best_lambda <- lambdas[which.min(rmses)]
-rmse_validation_regularized <- min(rmses)
+best_lambda
 
 ##########################################################
-# Train final regularized model on full edx
+# Train final model on FULL edx
 ##########################################################
+
 mu <- mean(edx$rating)
 
 b_i <- edx %>%
@@ -167,30 +137,21 @@ b_u <- edx %>%
   group_by(userId) %>%
   summarize(b_u = sum(rating - mu - b_i) / (n() + best_lambda), .groups = "drop")
 
-pred_regularized <- final_holdout_test %>%
+##########################################################
+# Predict on final_holdout_test
+##########################################################
+
+predictions <- final_holdout_test %>%
   left_join(b_i, by = "movieId") %>%
   left_join(b_u, by = "userId") %>%
   mutate(pred = mu + b_i + b_u)
 
-pred_regularized$pred[is.na(pred_regularized$pred)] <- mu
-
-rmse_regularized <- RMSE(final_holdout_test$rating, pred_regularized$pred)
+# Replace missing predictions
+predictions$pred[is.na(predictions$pred)] <- mu
 
 ##########################################################
-# Final comparison table
+# Evaluate model
 ##########################################################
-results <- tibble(
-  Model = c("Mean only",
-            "Movie effect",
-            "Movie + User effect",
-            "Regularized (tuned on edx)"),
 
-  RMSE_edx_validation = c(NA, NA, NA, rmse_validation_regularized),
-
-  RMSE_final_holdout_test = c(rmse_mean,
-                              rmse_movie,
-                              rmse_movie_user,
-                              rmse_regularized)
-)
-
-results %>% arrange(RMSE_final_holdout_test)
+final_rmse <- RMSE(final_holdout_test$rating, predictions$pred)
+final_rmse
