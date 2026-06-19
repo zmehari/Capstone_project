@@ -1,0 +1,362 @@
+---
+title: "MovieLens 10M Recommendation System"
+author: "Prepared for course submission"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center"
+)
+```
+
+# Executive Summary
+
+This report presents the development of a movie recommendation system using the external MovieLens 10M dataset from GroupLens. The goal of the project is to predict user ratings for movies as accurately as possible, using the Root Mean Square Error (RMSE) as the evaluation metric. The analytical workflow follows the project requirement of partitioning the data into an `edx` set for model development and a `final_holdout_test` set reserved strictly for final evaluation.
+
+The analysis begins with data downloading, cleaning, and preparation of the ratings and movie metadata files. Exploratory data analysis is then used to understand the distribution of ratings, the number of users and movies, and other basic characteristics of the dataset. Several progressively stronger models are compared: a global mean model, a movie-effect model, a movie-plus-user-effect model, and a regularized movie-plus-user-effect model.
+
+The final model selected for this project is a regularized movie and user effects model. Regularization helps control overfitting by shrinking extreme estimates for movies or users with relatively few observations. The final model is trained on the full `edx` set and then evaluated once on `final_holdout_test`. The final RMSE produced by the model is **`r round(final_rmse, 5)`**.
+
+# Introduction
+
+Recommendation systems are widely used in digital platforms to personalize content and improve user experience. In the context of movies, recommendation systems aim to predict how much a user may like a film they have not yet rated. This project uses the MovieLens 10M dataset to build such a system.
+
+The MovieLens 10M dataset contains user-generated movie ratings and associated movie metadata. The ratings file records user identifiers, movie identifiers, rating values, and timestamps, while the movies file provides movie titles and genres. This project uses these data to model rating behavior and estimate unseen ratings.
+
+The main research question for the project is straightforward: *How accurately can we predict movie ratings for users using historical rating information?* To answer this question, several models are trained and compared, and a final model is chosen based on validation RMSE.
+
+# Methods and Analysis
+
+## Data source and preparation
+
+```{r packages}
+required_packages <- c("tidyverse", "caret", "lubridate")
+installed <- rownames(installed.packages())
+for(p in required_packages){
+  if(!(p %in% installed)) install.packages(p, repos = "https://cloud.r-project.org")
+}
+
+library(tidyverse)
+library(caret)
+library(lubridate)
+```
+
+```{r rmse-function}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+```{r data-download-and-load}
+options(timeout = 120)
+dl <- "ml-10M100K.zip"
+if(!file.exists(dl)) download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings_file <- "ml-10M100K/ratings.dat"
+movies_file  <- "ml-10M100K/movies.dat"
+if(!file.exists(ratings_file)) unzip(dl, ratings_file)
+if(!file.exists(movies_file))  unzip(dl, movies_file)
+
+ratings <- as.data.frame(str_split(read_lines(ratings_file), fixed("::"), simplify = TRUE),
+                         stringsAsFactors = FALSE)
+colnames(ratings) <- c("userId", "movieId", "rating", "timestamp")
+ratings <- ratings %>%
+  mutate(userId = as.integer(userId),
+         movieId = as.integer(movieId),
+         rating = as.numeric(rating),
+         timestamp = as.integer(timestamp))
+
+movies <- as.data.frame(str_split(read_lines(movies_file), fixed("::"), simplify = TRUE),
+                        stringsAsFactors = FALSE)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- movies %>% mutate(movieId = as.integer(movieId))
+
+movielens <- left_join(ratings, movies, by = "movieId") %>%
+  mutate(
+    rating_datetime = as_datetime(timestamp),
+    rating_year = year(rating_datetime),
+    movie_year = str_extract(title, "\\((\\d{4})\\)$"),
+    movie_year = as.integer(str_remove_all(movie_year, "[()]"))
+  )
+```
+
+The raw files are imported, converted to the appropriate data types, and merged using `movieId`. Additional variables such as rating year and movie release year are created to support exploration and possible future modeling extensions.
+
+## Data partitioning
+
+```{r partition-data}
+set.seed(1, sample.kind = "Rounding")
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index, ]
+temp <- movielens[test_index, ]
+
+final_holdout_test <- temp %>%
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+removed <- anti_join(temp, final_holdout_test)
+edx <- rbind(edx, removed)
+
+rm(temp, removed)
+
+set.seed(1, sample.kind = "Rounding")
+train_index <- createDataPartition(y = edx$rating, times = 1, p = 0.9, list = FALSE)
+train_set <- edx[train_index, ]
+temp_test <- edx[-train_index, ]
+
+test_set <- temp_test %>%
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+removed <- anti_join(temp_test, test_set)
+train_set <- rbind(train_set, removed)
+
+rm(temp_test, removed)
+```
+
+The data are first divided into `edx` and `final_holdout_test`, with the holdout set reserved exclusively for the final evaluation. The `edx` set is then split again into `train_set` and `test_set` to support model development and model selection. This approach avoids information leakage and ensures that the reported final RMSE is based on data that were not used during model training or tuning.
+
+## Exploratory data analysis
+
+```{r descriptive-statistics}
+summary_table <- tibble(
+  Metric = c("Rows in edx",
+             "Rows in final_holdout_test",
+             "Unique users in edx",
+             "Unique movies in edx",
+             "Average rating in edx"),
+  Value = c(nrow(edx),
+            nrow(final_holdout_test),
+            n_distinct(edx$userId),
+            n_distinct(edx$movieId),
+            round(mean(edx$rating), 3))
+)
+summary_table
+```
+
+```{r rating-distribution-plot}
+edx %>%
+  ggplot(aes(rating)) +
+  geom_histogram(binwidth = 0.5, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of Ratings in the edx Dataset",
+       x = "Rating",
+       y = "Count") +
+  theme_minimal()
+```
+
+```{r most-rated-movies}
+most_rated_movies <- edx %>%
+  count(title, sort = TRUE) %>%
+  slice(1:10)
+most_rated_movies
+```
+
+```{r most-rated-movies-plot}
+most_rated_movies %>%
+  ggplot(aes(reorder(title, n), n)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Top 10 Most Frequently Rated Movies",
+       x = "Movie title",
+       y = "Number of ratings") +
+  theme_minimal()
+```
+
+The exploratory analysis shows that ratings are concentrated around the middle to upper end of the scale, especially around ratings such as 3, 3.5, 4, and 5. This pattern suggests that users are generally more likely to rate movies positively than negatively. The analysis also reveals that some movies attract many ratings while others receive much less attention, a pattern that is common in recommendation data.
+
+## Modeling approach
+
+The project compares four models of increasing complexity:
+
+1. **Global mean model**: predicts every rating using the same overall average.
+2. **Movie effect model**: adjusts the global mean by a movie-specific bias.
+3. **Movie + user effect model**: adds a user-specific bias to account for individual rating tendencies.
+4. **Regularized movie + user effect model**: applies shrinkage to the movie and user effects in order to reduce overfitting.
+
+The regularized model is defined conceptually as:
+
+\[
+\hat{r}_{ui} = \mu + b_i + b_u
+\]
+
+where \(\mu\) is the global average rating, \(b_i\) is the movie effect, and \(b_u\) is the user effect. Regularization is applied when estimating the movie and user effects.
+
+```{r baseline-and-regularized-models}
+rmse_results <- tibble(Model = character(), RMSE = numeric())
+
+# 1. Global mean model
+mu <- mean(train_set$rating)
+pred_mean <- rep(mu, nrow(test_set))
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model = "Global mean",
+                                 RMSE = RMSE(test_set$rating, pred_mean)))
+
+# 2. Movie effect model
+movie_avgs <- train_set %>%
+  group_by(movieId) %>%
+  summarize(b_i = mean(rating - mu), .groups = "drop")
+
+pred_movie <- test_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  mutate(pred = mu + b_i) %>%
+  pull(pred)
+
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model = "Movie effect",
+                                 RMSE = RMSE(test_set$rating, pred_movie)))
+
+# 3. Movie + user effect model
+user_avgs <- train_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i), .groups = "drop")
+
+pred_movie_user <- test_set %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(user_avgs, by = "userId") %>%
+  mutate(
+    b_i = ifelse(is.na(b_i), 0, b_i),
+    b_u = ifelse(is.na(b_u), 0, b_u),
+    pred = mu + b_i + b_u
+  ) %>%
+  pull(pred)
+
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model = "Movie + user effect",
+                                 RMSE = RMSE(test_set$rating, pred_movie_user)))
+
+# 4. Regularized movie + user effect model
+lambdas <- seq(0, 10, 0.25)
+rmses <- sapply(lambdas, function(l){
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu) / (n() + l), .groups = "drop")
+
+  b_u <- train_set %>%
+    left_join(b_i, by = "movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu - b_i) / (n() + l), .groups = "drop")
+
+  pred <- test_set %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(
+      b_i = ifelse(is.na(b_i), 0, b_i),
+      b_u = ifelse(is.na(b_u), 0, b_u),
+      pred = mu + b_i + b_u
+    ) %>%
+    pull(pred)
+
+  RMSE(test_set$rating, pred)
+})
+
+lambda_results <- tibble(lambda = lambdas, RMSE = rmses)
+lambda_opt <- lambda_results %>% arrange(RMSE) %>% slice(1) %>% pull(lambda)
+best_dev_rmse <- lambda_results %>% arrange(RMSE) %>% slice(1) %>% pull(RMSE)
+
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model = paste0("Regularized movie + user effect (lambda = ", lambda_opt, ")"),
+                                 RMSE = best_dev_rmse))
+```
+
+```{r lambda-plot}
+lambda_results %>%
+  ggplot(aes(lambda, RMSE)) +
+  geom_line(color = "darkgreen") +
+  geom_point(color = "firebrick") +
+  labs(title = "Regularization Tuning Curve",
+       x = "Lambda",
+       y = "RMSE") +
+  theme_minimal()
+```
+
+# Results
+
+## Development results
+
+```{r development-results-table}
+rmse_results %>% arrange(RMSE)
+```
+
+The model comparison shows a clear progression in predictive performance. The global mean model provides a simple baseline but ignores meaningful variation across users and movies. Adding movie effects improves accuracy because some films tend to be rated higher or lower than average. Adding user effects improves performance further because some users consistently assign higher or lower ratings than others.
+
+The strongest development model is the regularized movie and user effects model. This model balances flexibility with protection against overfitting by shrinking unstable estimates. The value of lambda is selected based on the smallest RMSE on the development test set.
+
+## Final evaluation on the holdout set
+
+```{r final-model-and-holdout-rmse}
+mu_final <- mean(edx$rating)
+
+b_i_final <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu_final) / (n() + lambda_opt), .groups = "drop")
+
+b_u_final <- edx %>%
+  left_join(b_i_final, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu_final - b_i) / (n() + lambda_opt), .groups = "drop")
+
+final_predictions <- final_holdout_test %>%
+  left_join(b_i_final, by = "movieId") %>%
+  left_join(b_u_final, by = "userId") %>%
+  mutate(
+    b_i = ifelse(is.na(b_i), 0, b_i),
+    b_u = ifelse(is.na(b_u), 0, b_u),
+    predicted_rating = mu_final + b_i + b_u
+  )
+
+final_rmse <- RMSE(final_predictions$rating, final_predictions$predicted_rating)
+final_rmse
+```
+
+The final RMSE on `final_holdout_test` is **`r round(final_rmse, 5)`**.
+
+This result indicates that the final model predicts ratings with substantially lower error than the simplest baseline model. In practical terms, the use of movie and user effects captures much of the systematic variation in the data, while regularization improves generalization to unseen ratings.
+
+## Output files produced by the project script
+
+```{r save-project-outputs}
+write.csv(rmse_results %>% arrange(RMSE), "development_rmse_results.csv", row.names = FALSE)
+write.csv(lambda_results %>% arrange(RMSE), "lambda_tuning_results.csv", row.names = FALSE)
+
+write.csv(
+  final_predictions %>%
+    select(userId, movieId, title, genres, rating, predicted_rating),
+  "predicted_movie_ratings.csv",
+  row.names = FALSE
+)
+
+writeLines(
+  c(
+    paste("Best development lambda:", lambda_opt),
+    paste("Final RMSE on final_holdout_test:", final_rmse)
+  ),
+  "rmse_score.txt"
+)
+```
+
+# Conclusion
+
+This project developed and evaluated a recommendation system using the MovieLens 10M dataset. The analysis showed that more informative models consistently outperformed simpler baselines. The best-performing model in this project was a regularized movie and user effects model, which was selected using a validation split derived from the `edx` dataset and then evaluated once on the held-out test set.
+
+The strengths of this modeling strategy are its interpretability, computational efficiency, and solid predictive performance. However, the approach also has limitations. It does not incorporate richer forms of signal such as genre interactions, rating time trends, implicit feedback, or latent factor structure. As a result, there is still room to improve performance by using more advanced recommendation techniques.
+
+Future work could extend the analysis by adding genre-specific effects, temporal effects, matrix factorization approaches, or hybrid models that combine collaborative and content information. Additional evaluation metrics such as MAE, Precision@K, or Recall@K could also provide deeper insight into recommendation quality beyond point prediction accuracy.
+
+# References
+
+Harper, F. M. and Konstan, J. A. (2015). *The MovieLens Datasets: History and Context*. ACM Transactions on Interactive Intelligent Systems, 5(4), Article 19.
+
+GroupLens Research. *MovieLens 10M Dataset*. Available at: https://grouplens.org/datasets/movielens/10m/
