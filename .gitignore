@@ -1,6 +1,5 @@
-*.zip
 *.csv
 *.dat
+*.zip
 *.RData
 *.Rhistory
-.Rproj.user
