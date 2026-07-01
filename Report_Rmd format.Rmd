@@ -2,13 +2,13 @@
 
 # Movie Recommendation System Report
 
-# Introduction / Executive Summary
+##  Introduction / Executive Summary
 
 This report aims to summarize a movie recommendation project which was analyzed from the MovieLens 10 M data set to determine how users rate movies and evaluate predictive accuracy using  the root mean squared error (RMSE).
 The workflow loads and cleans the ratings and movie metadata, creates a training set and a final hold-out test set, tunes a regularization parameter on an internal validation split, estimates a regularized movie-and-user bias model, and evaluates the fitted model on unused data. Using the supplied analysis, the selected regularization strength is lambda = 5 and the final model achieves an RMSE of 0.8648177.
 
 
-# Methods / Analysis
+##  Methods / Analysis
 
 The analysis relies primarily on the **tidyverse** for data wrangling and visualization and **caret** for data partitioning. The MovieLens 10M dataset is downloaded directly from GroupLens.
 
@@ -128,14 +128,12 @@ genre_counts %>%
        y = "Number of unique movies")
 ```
 
-### EDA Insights
 
 The MovieLens data typically show that user ratings are concentrated around whole and half-star values, with moderate-to-high ratings appearing more frequently than very low ratings. Some widely known films attract a large number of user ratings, while genre distribution is broad and includes many cross-listed titles. These patterns motivate a model that accounts for both movie-level popularity/quality effects and systematic user tendencies to rate higher or lower than average.
 
 
-### RMSE Function
+###  RMSE Function
 
-The project evaluates predictive accuracy using RMSE, which measures the average magnitude of prediction error.
 
 ```{r rmse-function}
 RMSE <- function(true_ratings, predicted_ratings){
@@ -215,7 +213,7 @@ tibble(lambda = lambdas, rmse = rmses) %>%
        y = "Validation RMSE")
 ```
 
-## 7. Train the Final Model on the Full `edx` Dataset
+### Train the Final Model on the Full `edx` Dataset
 
 ```{r final-model}
 mu <- mean(edx$rating)
@@ -230,7 +228,7 @@ b_u <- edx %>%
   summarize(b_u = sum(rating - mu - b_i) / (n() + best_lambda), .groups = "drop")
 ```
 
-## Predict on the Final Hold-Out Test Set and Evaluate Performance
+###  Predict on the Final Hold-Out Test Set and Evaluate Performance
 
 ```{r final-prediction-and-rmse}
 predictions <- final_holdout_test %>%
@@ -252,11 +250,11 @@ write.csv(predicted_movie_ratings, "predicted_movie_ratings.csv", row.names = FA
 writeLines(paste0("Final RMSE: ", round(final_rmse, 7)), "rmse_score.txt")
 ```
 
-# Results
+##  Results
 
 The internal validation procedure selected lambda = 5 as the best regularization value. The final model was then re-estimated on the full training set (edx) and used to predict ratings for the unused final hold-out test set. The resulting final RMSE is 0.8648177 which is < 0.86490. 
 
-# Conclusion, Limitations, and Future Work
+##  Conclusion, Limitations, and Future Work
 
 In summary, the project successfully builds a reproducible movie recommendation workflow from the MovieLens 10M dataset and shows that a regularized bias model can achieve strong predictive accuracy with relatively modest complexity. The chosen lambda of 5 and the final RMSE of 0.8648177 indicate that the model generalizes well to the hold-out set.
 The main limitations are that the model uses only additive user and movie effects and does not include richer information such as latent factors, time effects, or the full content information available in genres and titles. Future work could extend the approach by adding genre terms, temporal adjustments, matrix factorization, or ensemble methods, and by evaluating recommendation quality using ranking metrics alongside RMSE.
