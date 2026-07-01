@@ -1,0 +1,261 @@
+
+
+# Movie Recommendation System Report
+
+##  Introduction / Executive Summary
+
+This report aims to summarize a movie recommendation project which was analyzed from the MovieLens 10 M data set to determine how users rate movies and evaluate predictive accuracy using  the root mean squared error (RMSE).
+The workflow loads and cleans the ratings and movie metadata, creates a training set and a final hold-out test set, tunes a regularization parameter on an internal validation split, estimates a regularized movie-and-user bias model, and evaluates the fitted model on unused data. Using the supplied analysis, the selected regularization strength is lambda = 5 and the final model achieves an RMSE of 0.8648177.
+
+
+##  Methods / Analysis
+
+The analysis relies primarily on the **tidyverse** for data wrangling and visualization and **caret** for data partitioning. The MovieLens 10M dataset is downloaded directly from GroupLens.
+
+```{r packages-and-download}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+
+options(timeout = 120)
+
+dl <- "ml-10M100K.zip"
+if(!file.exists(dl))
+  download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings_file <- "ml-10M100K/ratings.dat"
+if(!file.exists(ratings_file))
+  unzip(dl, ratings_file)
+
+movies_file <- "ml-10M100K/movies.dat"
+if(!file.exists(movies_file))
+  unzip(dl, movies_file)
+```
+
+
+The ratings and movie metadata are stored in `::` separated text files. These are parsed into data frames, converted to the correct data types, and merged into a single `movielens` table.
+
+```{r data-cleaning}
+ratings <- as.data.frame(str_split(read_lines(ratings_file), fixed("::"), simplify = TRUE),
+                         stringsAsFactors = FALSE)
+colnames(ratings) <- c("userId", "movieId", "rating", "timestamp")
+ratings <- ratings %>%
+  mutate(userId = as.integer(userId),
+         movieId = as.integer(movieId),
+         rating = as.numeric(rating),
+         timestamp = as.integer(timestamp))
+
+movies <- as.data.frame(str_split(read_lines(movies_file), fixed("::"), simplify = TRUE),
+                        stringsAsFactors = FALSE)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- movies %>%
+  mutate(movieId = as.integer(movieId))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+glimpse(movielens)
+summary(movielens$rating)
+```
+
+
+Ten percent of the full dataset is reserved as an unseen final test set. To make valid predictions, the final hold-out test set is restricted to users and movies that also appear in the training data; removed rows are placed back into the training set.
+
+```{r create-splits}
+set.seed(1, sample.kind = "Rounding")
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index, ]
+temp <- movielens[test_index, ]
+
+final_holdout_test <- temp %>%
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+removed <- anti_join(temp, final_holdout_test)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, removed)
+
+dataset_sizes <- tibble(
+  dataset = c("Training set (edx)", "Final hold-out test set"),
+  n_rows = c(nrow(edx), nrow(final_holdout_test))
+)
+dataset_sizes
+```
+
+
+Exploration helps to understand the shape of the data before modeling. Below, the report summarizes the rating distribution, the most frequently rated movies, and the most common genres.
+
+```{r rating-distribution-plot}
+edx %>%
+  count(rating) %>%
+  ggplot(aes(x = rating, y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Distribution of Ratings in the Training Data",
+       x = "Rating",
+       y = "Count")
+```
+
+```{r most-rated-movies}
+top_movies <- edx %>%
+  count(title, sort = TRUE) %>%
+  slice_head(n = 10)
+
+top_movies %>%
+  ggplot(aes(x = reorder(title, n), y = n)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Top 10 Most Frequently Rated Movies",
+       x = "Movie title",
+       y = "Number of ratings")
+```
+
+```{r genre-summary}
+# Split genres to see which categories appear most often in the movie catalogue.
+genre_counts <- edx %>%
+  distinct(movieId, title, genres) %>%
+  separate_rows(genres, sep = "\\|") %>%
+  count(genres, sort = TRUE)
+
+genre_counts %>%
+  slice_head(n = 10) %>%
+  ggplot(aes(x = reorder(genres, n), y = n)) +
+  geom_col(fill = "forestgreen") +
+  coord_flip() +
+  labs(title = "Top 10 Genres in the Movie Catalogue",
+       x = "Genre",
+       y = "Number of unique movies")
+```
+
+
+The MovieLens data typically show that user ratings are concentrated around whole and half-star values, with moderate-to-high ratings appearing more frequently than very low ratings. Some widely known films attract a large number of user ratings, while genre distribution is broad and includes many cross-listed titles. These patterns motivate a model that accounts for both movie-level popularity/quality effects and systematic user tendencies to rate higher or lower than average.
+
+
+###  RMSE Function
+
+
+```{r rmse-function}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+### Regularized Movie and User Effect Model
+
+The final model predicts ratings using:
+
+\[
+\hat{r}_{u,i} = \mu + b_i + b_u
+\]
+
+where:
+
+- \(\mu\) is the global mean rating,
+- \(b_i\) is the movie-specific effect,
+- \(b_u\) is the user-specific effect,
+- and both effects are regularized using a tuning parameter \(\lambda\).
+
+Regularization prevents movies or users with very few observations from receiving overly extreme estimates.
+
+## Tune Lambda on an Internal Validation Split
+
+The training data are split again into a temporary training set and a validation set. Lambda values from 0 to 10 (in increments of 0.25) are evaluated, and the value that minimizes validation RMSE is selected.
+
+```{r lambda-tuning}
+set.seed(1)
+
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE)
+train_temp <- edx[-test_index, ]
+validate_temp <- edx[test_index, ]
+
+validate_temp <- validate_temp %>%
+  semi_join(train_temp, by = "movieId") %>%
+  semi_join(train_temp, by = "userId")
+
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+  mu <- mean(train_temp$rating)
+
+  b_i <- train_temp %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu) / (n() + l), .groups = "drop")
+
+  b_u <- train_temp %>%
+    left_join(b_i, by = "movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu - b_i) / (n() + l), .groups = "drop")
+
+  preds <- validate_temp %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+
+  preds[is.na(preds)] <- mu
+  RMSE(validate_temp$rating, preds)
+})
+
+best_lambda <- lambdas[which.min(rmses)]
+best_lambda
+```
+
+```{r lambda-plot}
+tibble(lambda = lambdas, rmse = rmses) %>%
+  ggplot(aes(x = lambda, y = rmse)) +
+  geom_line(color = "purple", linewidth = 1) +
+  geom_point(color = "purple") +
+  geom_vline(xintercept = best_lambda, linetype = "dashed", color = "red") +
+  labs(title = "Validation RMSE by Lambda",
+       subtitle = paste("Best lambda =", best_lambda),
+       x = "Lambda",
+       y = "Validation RMSE")
+```
+
+### Train the Final Model on the Full `edx` Dataset
+
+```{r final-model}
+mu <- mean(edx$rating)
+
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu) / (n() + best_lambda), .groups = "drop")
+
+b_u <- edx %>%
+  left_join(b_i, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu - b_i) / (n() + best_lambda), .groups = "drop")
+```
+
+###  Predict on the Final Hold-Out Test Set and Evaluate Performance
+
+```{r final-prediction-and-rmse}
+predictions <- final_holdout_test %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  mutate(pred = mu + b_i + b_u)
+
+predictions$pred[is.na(predictions$pred)] <- mu
+
+final_rmse <- RMSE(final_holdout_test$rating, predictions$pred)
+final_rmse
+```
+
+```{r save-outputs, eval=FALSE}
+# Optional: save outputs for submission / inspection
+predicted_movie_ratings <- predictions %>%
+  select(userId, movieId, title, genres, rating, pred)
+write.csv(predicted_movie_ratings, "predicted_movie_ratings.csv", row.names = FALSE)
+writeLines(paste0("Final RMSE: ", round(final_rmse, 7)), "rmse_score.txt")
+```
+
+##  Results
+
+The internal validation procedure selected lambda = 5 as the best regularization value. The final model was then re-estimated on the full training set (edx) and used to predict ratings for the unused final hold-out test set. The resulting final RMSE is 0.8648177 which is < 0.86490. 
+
+##  Conclusion, Limitations, and Future Work
+
+In summary, the project successfully builds a reproducible movie recommendation workflow from the MovieLens 10M dataset and shows that a regularized bias model can achieve strong predictive accuracy with relatively modest complexity. The chosen lambda of 5 and the final RMSE of 0.8648177 indicate that the model generalizes well to the hold-out set.
+The main limitations are that the model uses only additive user and movie effects and does not include richer information such as latent factors, time effects, or the full content information available in genres and titles. Future work could extend the approach by adding genre terms, temporal adjustments, matrix factorization, or ensemble methods, and by evaluating recommendation quality using ranking metrics alongside RMSE.
+
